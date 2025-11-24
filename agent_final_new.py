@@ -712,6 +712,26 @@ class FinalSemiconductorQAAgent:
                 corrects.append('Correct' in text)
         return corrects
     
+    async def check_alternative_answer(self, question: str, gt_answer: str,
+                                      pred_answer: str, statements: str) -> bool:
+        """检查替代答案（优化版：使用安全JSON解析）"""
+        prompt = SemiconductorQAPrompts.check_alternative_ans.format(
+            question=question,
+            gt_answer=gt_answer,
+            pred_answer=pred_answer,
+            statements=statements
+        )
+        text = await self.call_llm(prompt, temperature=0.3)
+        
+        # 使用安全解析
+        result = self._safe_json_parse(text, debug_prefix="替代答案检查")
+        
+        if result:
+            return result.get('judgement', 'no').lower() == 'yes'
+        else:
+            # 解析失败，尝试文本判断
+            return 'yes' in text.lower()
+    
     # ============ ⭐ 主生成流程 ============
     
     async def generate(self, semaphore: asyncio.Semaphore, save_path: str):
@@ -1066,22 +1086,71 @@ class FinalSemiconductorQAAgent:
                     continue
                 
                 # ========================================
-                # 🔧 优化7：移除测试环节（彻底解决多跳成功率问题）
-                # 修复时间：2025-11-19
-                # 问题：即使放宽测试标准到25%，如果答案全错（0/4）还是失败
-                #       导致很多多跳组合被拒绝，最终还是1个源QA
-                # 分析：
-                #   - 用户核心需求是"多个问题组合"（多跳），不是答案正确性
-                #   - 筛选已经保证了质量（6个评估标准：因果性、完整性等）
-                #   - 测试是最大瓶颈：即使放宽到1/4，0/4还是失败
-                #   - 测试成本高：每次生成4个答案+判断，很慢
-                # 解决：完全移除测试环节，只要筛选通过就接受
-                # 效果：多跳成功率从70%提升到90%，几乎所有筛选通过的都保留
+                # ⭐⭐⭐ 质量检查流程（恢复版）⭐⭐⭐
+                # 目标：确保生成的QA都是高质量
+                # 检查流程：
+                #   1. 有效性检查 ✓（已通过）
+                #   2. 直接生成测试（生成4个答案）
+                #   3. LLM判断答案正确性
+                #   4. 替代答案检查（确保答案唯一性）
+                # 只有全部通过才更新memory，否则continue
                 # ========================================
-                # ⭐⭐⭐ 关键修改：移除测试，直接接受 ⭐⭐⭐
-                memory = memory_new  # 直接更新memory，保留多跳组合
-                ready_to_exit = True
-                print("[INFO] ✓ 筛选通过，直接接受（已移除测试环节）")
+                
+                # 检查2：直接生成测试
+                try:
+                    print(f"[TEST] 直接生成测试...")
+                    answers = await self.direct_generate(q_new, n=4)
+                except Exception as e:
+                    print(f"[WARNING] 直接生成失败: {e}")
+                    continue
+                
+                # 检查3：LLM判断答案
+                try:
+                    corrects = await self.llm_judge_answer(
+                        q_new, answers, memory.qa['answer']
+                    )
+                except Exception as e:
+                    print(f"[WARNING] LLM判断失败: {e}")
+                    continue
+                
+                # 检查4：替代答案检查
+                is_alternative = False
+                for pred_ans, correct in zip(answers, corrects):
+                    if pred_ans and not correct:
+                        try:
+                            is_alternative = await self.check_alternative_answer(
+                                q_new, memory.qa['answer'], pred_ans,
+                                memory.statements_repr()
+                            )
+                        except Exception as e:
+                            print(f"[WARNING] 检查替代答案失败: {e}")
+                            is_alternative = False
+                        
+                        if is_alternative:
+                            print(f"[WARNING] 存在替代答案: '{pred_ans[:50]}...'")
+                            break
+                
+                if is_alternative:
+                    print(f"[WARNING] 第{turn+1}轮存在替代答案，跳过")
+                    continue
+                
+                # ✅ 所有检查通过，更新memory
+                memory = memory_new
+                acc = f"{sum(corrects)}/{len(corrects)}"
+                print(f"[RESULT] ✓ 通过所有检查，直接生成准确率: {acc}")
+                
+                memory.qa_history.append({
+                    'question': q_new,
+                    'answer': memory.qa['answer'],
+                    'direct_gen_acc': acc
+                })
+                memory.edit_history.append(f"直接生成准确率: {acc}")
+                
+                # 如果4个答案全错，准备退出（问题够难）
+                if not any(corrects):
+                    ready_to_exit = True
+                    print(f"[INFO] 第{turn+1}轮问题LLM全部答错，准备退出")
+                
                 # ========================================
             
             # Step 4: 保存
@@ -1096,6 +1165,20 @@ class FinalSemiconductorQAAgent:
             final_qa_count = len(memory.relevant)  # ⭐ 最终成功的源QA数量
             # ========================================
             
+            # ========================================
+            # ⭐⭐⭐ 质量标志字段（用于quality_filter）⭐⭐⭐
+            # ========================================
+            # 计算质量标志
+            passed_all_checks = True  # 在新流程中，能到这里说明通过了所有检查
+            
+            # 检查是否经过了筛选和答案重生成
+            passed_filtering = self.enable_qa_filtering
+            answer_regenerated = self.enable_answer_regeneration
+            
+            # 获取最后一次的直接生成准确率
+            last_qa_history = memory.qa_history[-1] if memory.qa_history else {}
+            direct_gen_acc = last_qa_history.get('direct_gen_acc', '0/0')
+            
             output = {
                 'uid': memory.uid,
                 'question': memory.qa['question'],
@@ -1106,10 +1189,16 @@ class FinalSemiconductorQAAgent:
                 'edit_history': memory.edit_history,
                 'action_stats': dict(action_stats),
                 'num_turns': turn + 1,
-                'num_hops': num_hops,  # ⭐ 保持原逻辑：执行的SELECT次数+1
-                'final_qa_count': final_qa_count,  # 🆕 新增：最终的源QA数量
-                'target_hops': target_hops,  # 🆕 本次QA的目标跳数（1-4随机）
+                'num_hops': num_hops,
+                'final_qa_count': final_qa_count,
+                'target_hops': target_hops,
                 'max_hops': self.max_hops,
+                # ⭐ 质量标志（用于quality_filter）
+                'passed_all_checks': passed_all_checks,
+                'passed_filtering': passed_filtering,
+                'answer_regenerated': answer_regenerated,
+                'direct_gen_acc': direct_gen_acc,
+                # 功能开关
                 'qa_filtering_enabled': self.enable_qa_filtering,
                 'answer_regeneration_enabled': self.enable_answer_regeneration,
                 'bridge_check_enabled': self.enable_bridge_check,

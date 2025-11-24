@@ -37,7 +37,8 @@ from utils import (
     validate_qa_data,
     generate_batch_with_monitoring,
     merge_generated_qa,
-    print_usage_distribution
+    print_usage_distribution,
+    filter_by_quality  # ⭐ 新增：质量筛选功能
 )
 
 
@@ -247,6 +248,25 @@ async def main():
             kb_stats = kb.get_usage_stats()
             print_usage_distribution(kb_stats)
             
+            # ⭐⭐⭐ 质量筛选（High Quality Filter）⭐⭐⭐
+            print(f"\n{'='*80}")
+            print(f"执行质量筛选...")
+            print(f"{'='*80}")
+            high_quality_files = filter_by_quality(args.output)
+            
+            # 保存高质量QA列表
+            if high_quality_files:
+                high_quality_list_path = f"{args.output}/high_quality_qa_list.json"
+                import json
+                with open(high_quality_list_path, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'total_generated': stats['successful'],
+                        'high_quality_count': len(high_quality_files),
+                        'quality_rate': len(high_quality_files) / stats['successful'] if stats['successful'] > 0 else 0,
+                        'high_quality_files': [f.split('/')[-1] for f in high_quality_files]
+                    }, f, ensure_ascii=False, indent=2)
+                print(f"[SAVE] 高质量QA列表已保存: {high_quality_list_path}")
+            
             # 合并输出
             if args.merge_output:
                 merge_generated_qa(args.output)
@@ -254,9 +274,11 @@ async def main():
             print(f"\n{'='*80}")
             print(f"生成完成！ 🎉")
             print(f"{'='*80}")
-            print(f"成功: {stats['successful']}")
+            print(f"总生成数: {stats['successful']}")
+            print(f"高质量QA数: {len(high_quality_files)}")
+            print(f"质量通过率: {len(high_quality_files) / stats['successful'] * 100:.1f}%" if stats['successful'] > 0 else "N/A")
             print(f"平均轮数: {stats.get('avg_turns', 0):.2f}")
-            print(f"输出: {args.output}")
+            print(f"输出目录: {args.output}")
             
             # embedding统计
             if args.use_embedding and kb.use_embedding:

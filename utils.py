@@ -127,14 +127,19 @@ async def generate_batch_with_monitoring(agent, save_path: str,
         try:
             result = await agent.generate(semaphore, save_path)
             if result:
-                stats['successful'] += 1
-                stats['total_turns'] += result.get('num_turns', 0)
-                if result.get('has_multihop'):
-                    stats['multihop_count'] += 1
-                if result.get('passed_filtering'):
-                    stats['passed_filtering'] += 1
-                if result.get('answer_regenerated'):
-                    stats['answer_regenerated'] += 1
+                # ⭐⭐⭐ 只有通过所有检查的才算成功 ⭐⭐⭐
+                if result.get('passed_all_checks', False):
+                    stats['successful'] += 1
+                    stats['total_turns'] += result.get('num_turns', 0)
+                    if result.get('has_multihop'):
+                        stats['multihop_count'] += 1
+                    if result.get('passed_filtering'):
+                        stats['passed_filtering'] += 1
+                    if result.get('answer_regenerated'):
+                        stats['answer_regenerated'] += 1
+                else:
+                    # 虽然生成了QA，但未通过所有检查
+                    stats['failed'] += 1
             else:
                 stats['failed'] += 1
             
@@ -161,9 +166,28 @@ async def generate_batch_with_monitoring(agent, save_path: str,
             stats['total_generated'] += 1
             return None
     
-    # 批量生成
-    tasks = [generate_one() for _ in range(target_count)]
-    results = await tqdm_asyncio.gather(*tasks, desc="生成QA")
+    # ⭐⭐⭐ 批量生成（持续生成直到达到目标高质量QA数量）⭐⭐⭐
+    # 由于有质量检查，需要生成更多才能达到target_count个高质量QA
+    # 策略：每次生成batch_size个，直到successful达到target_count
+    generated_count = 0
+    pbar = tqdm_asyncio(total=target_count, desc="生成高质量QA")
+    
+    while stats['successful'] < target_count:
+        # 每次生成batch_size个
+        tasks = [generate_one() for _ in range(batch_size)]
+        batch_results = await asyncio.gather(*tasks)
+        generated_count += batch_size
+        
+        # 更新进度条
+        pbar.n = stats['successful']
+        pbar.set_postfix({
+            'Success': stats['successful'],
+            'Failed': stats['failed'],
+            'Rate': f"{stats['successful']/stats['total_generated']*100:.1f}%" if stats['total_generated'] > 0 else "0%"
+        })
+        pbar.refresh()
+    
+    pbar.close()
     
     # 计算最终统计
     stats['end_time'] = time.time()
@@ -267,35 +291,73 @@ def validate_qa_data(qa_data: List[Dict]) -> List[Dict]:
 
 def filter_by_quality(output_dir: str, min_confidence: float = 0.6) -> List[str]:
     """
-    根据质量筛选生成的QA
+    根据质量筛选生成的QA（High Quality Filter）
+    
+    ⭐⭐⭐ 筛选标准（必须全部满足）⭐⭐⭐：
+    1. passed_all_checks = True（通过了所有4个质量检查）
+       - 有效性检查
+       - 直接生成测试
+       - LLM判断答案
+       - 替代答案检查
+    2. passed_filtering = True（通过了6大评估标准）
+    3. answer_regenerated = True（经过了答案重生成）
     
     Args:
         output_dir: 输出目录
-        min_confidence: 最小置信度
+        min_confidence: 最小置信度（保留参数，未来可用）
     
     Returns:
         高质量QA文件列表
     """
-    print(f"\n[QUALITY] 筛选高质量QA (置信度 >= {min_confidence})...")
+    print(f"\n{'='*60}")
+    print(f"[QUALITY FILTER HIGH] 筛选高质量QA")
+    print(f"{'='*60}")
     
     high_quality_files = []
+    total_files = 0
+    
+    # 统计信息
+    stats = {
+        'passed_all_checks': 0,
+        'passed_filtering': 0,
+        'answer_regenerated': 0,
+        'all_criteria_met': 0
+    }
     
     for filename in os.listdir(output_dir):
         if filename.endswith('.json') and filename != 'generation_report.json':
+            total_files += 1
             filepath = os.path.join(output_dir, filename)
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     
-                    # 检查质量指标
+                    # 检查3个质量指标
+                    passed_all_checks = data.get('passed_all_checks', False)
                     passed_filtering = data.get('passed_filtering', False)
                     answer_regenerated = data.get('answer_regenerated', False)
                     
-                    if passed_filtering and answer_regenerated:
+                    # 统计
+                    if passed_all_checks:
+                        stats['passed_all_checks'] += 1
+                    if passed_filtering:
+                        stats['passed_filtering'] += 1
+                    if answer_regenerated:
+                        stats['answer_regenerated'] += 1
+                    
+                    # ⭐ 必须3个指标全部为True才算高质量
+                    if passed_all_checks and passed_filtering and answer_regenerated:
                         high_quality_files.append(filepath)
+                        stats['all_criteria_met'] += 1
+                        
             except Exception as e:
                 print(f"[WARNING] 读取文件失败 {filename}: {e}")
     
-    print(f"[QUALITY] 找到 {len(high_quality_files)} 个高质量QA")
+    print(f"\n[STATS] 总生成文件数: {total_files}")
+    print(f"[STATS] 通过所有检查 (passed_all_checks): {stats['passed_all_checks']}")
+    print(f"[STATS] 通过筛选 (passed_filtering): {stats['passed_filtering']}")
+    print(f"[STATS] 答案重生成 (answer_regenerated): {stats['answer_regenerated']}")
+    print(f"\n[RESULT] ✓ 高质量QA（全部满足3个条件）: {stats['all_criteria_met']}")
+    print(f"{'='*60}\n")
     
     return high_quality_files
